@@ -66,7 +66,8 @@ THE SOFTWARE.
 #include "string.h"
 #include "unistd.h"
 #include "time.h"
-#include <ncurses.h>
+#include "ncurses.h"
+#include "netdb.h"
 
 #define SHA1_DIGEST_LENGTH 20
 
@@ -350,6 +351,10 @@ static time_t token_bucket_time;
 static int token_bucket_tokens;
 
 FILE *dht_debug = NULL;
+
+char* bootstrap_nodes[] = {
+    "Your bootstrap peers here format [ip:port]"
+};
 
 #ifdef __GNUC__
     __attribute__ ((format (printf, 1, 2)))
@@ -3213,9 +3218,110 @@ void callback(void* closure, int event, const unsigned char* info_hash, const vo
     //return 1;
 //}
 
+void ping_all(){
+	int port = 0;
+	struct sockaddr_in tracker;
+	struct hostent *hostinfo;
+	struct in_addr *address;
+	struct sockaddr sa;
+
+	char *hostname;
+	char *ip;
+
+	int size = sizeof(bootstrap_nodes) / sizeof(bootstrap_nodes[0]);
+
+	for (int i=0;i<size;i++){
+		char *token;
+		char *current_node = strdup(bootstrap_nodes[i]);
+		token = strtok(current_node, ":");
+
+		if (token != NULL) {
+
+			hostname = token; // Get the first token as the IP address
+
+			token = strtok(NULL, ":"); // Get the next token (port)
+
+			if (token != NULL) {
+				port = atoi(token); // Convert the port token to an integer
+			}
+		}
+		printf("Pinging...%s\n", hostname);
+		hostinfo = gethostbyname(hostname);
+		address = (struct in_addr *) (hostinfo->h_addr);
+
+		ip = inet_ntoa(*address);
+
+		tracker.sin_family = AF_INET;
+		tracker.sin_port = htons(port);
+		inet_pton(AF_INET, ip, &(tracker.sin_addr));
+
+		memcpy(&sa, &tracker, sizeof(tracker));
+
+		//char ip_address[INET_ADDRSTRLEN];
+		// Convert the binary IP address to a human-readable string
+		//inet_ntop(AF_INET, &(tracker.sin_addr), ip_address, INET_ADDRSTRLEN);
+
+		dht_ping_node(&sa, sizeof(sa));
+	}
+}
+
+void Scan(char *buffer, time_t sleep_timer, int *closure){
+		printw("SCANNING...\n");
+		int port = 0;
+
+		struct sockaddr_in tracker;
+		struct hostent *hostinfo;
+		struct in_addr *address;
+
+		char *hostname;
+		char *ip;
+		//int i = 0;
+
+		int size = sizeof(bootstrap_nodes) / sizeof(bootstrap_nodes[0]);
+
+		for (int i=0;i<size;i++){
+			char *token;
+			char *current_node = strdup(bootstrap_nodes[i]);
+			token = strtok(current_node, ":");
+
+			if (token != NULL) {
+
+				hostname = token; // Get the first token as the IP address
+
+				token = strtok(NULL, ":"); // Get the next token (port)
+
+				if (token != NULL) {
+					port = atoi(token); // Convert the port token to an integer
+				}
+			}
+
+			hostinfo = gethostbyname(hostname);
+			address = (struct in_addr *) (hostinfo->h_addr);
+
+			ip = inet_ntoa(*address);
+
+			tracker.sin_family = AF_INET;
+			tracker.sin_port = htons(port);
+			inet_pton(AF_INET, ip, &(tracker.sin_addr));
+
+			struct sockaddr sa;
+				memcpy(&sa, &tracker, sizeof(tracker));
+
+			//char ip_address[INET_ADDRSTRLEN];
+			// Convert the binary IP address to a human-readable string
+			//inet_ntop(AF_INET, &(tracker.sin_addr), ip_address, INET_ADDRSTRLEN);
+
+            if (sizeof(*buffer) == 1){
+            	dht_periodic(buffer, 0,&sa, sizeof(sa),&sleep_timer, callback, closure);
+            } else{
+				dht_periodic(buffer, sizeof(*buffer),&sa, sizeof(sa),&sleep_timer, callback, closure);
+            }
+		}
+}
+
 int main(int argc, char* argv[]){
 
-	dht_debug = stdout;
+	//dht_debug = stdout;
 
 	int port = 6881;
 	struct timeval timeout;
@@ -3243,24 +3349,27 @@ int main(int argc, char* argv[]){
 
 
 	unsigned char* node_id = generate_nodeID();
+
 	if (dht_init(ipv4_socket, ipv6_socket, node_id, NULL) < 0){
 		printf("ERROR: reserving sockets failed!\n");
 		return 1;
 	}
 
+
 	struct sockaddr_in tracker;
-	    tracker.sin_family = AF_INET;
-	    tracker.sin_port = htons(1337);
-	    inet_pton(AF_INET, "93.158.213.92", &(tracker.sin_addr)); //tracker.opentrackr.org:1337
-
+	//struct hostent *hostinfo;
+	//struct in_addr *address;
 	struct sockaddr sa;
-	    memcpy(&sa, &tracker, sizeof(tracker));
+	//char *hostname;
+	char *ip;
+	//ping_all();
 
-	char ip_address[INET_ADDRSTRLEN];
-	   // Convert the binary IP address to a human-readable string
-	   inet_ntop(AF_INET, &(tracker.sin_addr), ip_address, INET_ADDRSTRLEN);
+	//struct in_addr *address;
 
-	char buffer[65535]; // the socket's receive buffer.
+	int size_buffer = 65535; //the size of the buffer.
+	int size_possible_nodes = sizeof(bootstrap_nodes) / sizeof(bootstrap_nodes[0]);
+
+	char buffer[size_buffer];
 	int closure;
 
 	initscr();  // Initialize ncurses
@@ -3271,21 +3380,63 @@ int main(int argc, char* argv[]){
 
 	int ch;
 	int good = 0, dubious = 0, cached = 0, incoming = 0;
+	int g = 0;
+	//char *hostname;
+	//char *ip;
+	bool bootstrapped = false;
+
+
+
 	while (1) {
+		if (!bootstrapped){
+			printw("\rbootstrapping...[%d/%d]", g+1, size_possible_nodes);
+		}
+
 		ch = getch();  // Check for a keypress without blocking
 
 		if (ch == 'q' || ch == 'Q') {
-		    printw("Exiting the while loop...\n");
+		    printw("Exiting...\n");
 		    break;
 		}
-	   //dht_ping_node(&sa, sizeof(sa));
+
+
+		char *token;
+		char *current_node = strdup(bootstrap_nodes[g]);
+		token = strtok(current_node, ":");
+		if (token != NULL) {
+
+			//hostname = token; // Get the first token as the IP address
+			ip = token;
+
+			token = strtok(NULL, ":"); // Get the next token (port)
+
+			if (token != NULL) {
+				port = atoi(token); // Convert the port token to an integer
+			}
+		}
+
+		//hostinfo = gethostbyname(hostname);
+		//address = (struct in_addr *) (ip);//(hostinfo->h_addr);
+
+		//ip = inet_ntoa(*address);
+
+		tracker.sin_family = AF_INET;
+		tracker.sin_port = htons(port);
+		inet_pton(AF_INET, ip, &(tracker.sin_addr));
+
+		memcpy(&sa, &tracker, sizeof(tracker));
+
+		if (!bootstrapped){
+			dht_ping_node(&sa, sizeof(sa));
+		}
+
 	   char* info_hash = "f1fa38021f9831440ae4fdc177872cc34a5ac7fc"; //Linux Mint Debian Edition 5 Cinnamon 64Bit ISO
 
 	   FD_ZERO(&read_fds);
 	   FD_SET(ipv4_socket, &read_fds);
 	   FD_SET(ipv6_socket, &read_fds);
 
-	   // Generate a random timeout value in the range of 1 to 30 seconds
+	   // Generate a random timeout value in the range of 1 to 5 seconds
 	   timeout.tv_sec = (int)(1 + rand() % 30);
 	   closure = timeout.tv_sec;
 	   timeout.tv_usec = 0;
@@ -3298,6 +3449,7 @@ int main(int argc, char* argv[]){
 	       exit(1);
 	       } else if (result_ipv4 == 0){// && result_ipv6 == 0) {
 	    	   dht_periodic(&buffer, 0,&sa, sizeof(sa),&timeout.tv_sec, callback, &closure);
+	    	   //Scan(buffer, timeout.tv_sec, &closure);
 	        } else {
 	        	if (result_ipv4 > 0){
 	        		sockfd = ipv4_socket;
@@ -3307,28 +3459,43 @@ int main(int argc, char* argv[]){
 	        	//}
 	            if (FD_ISSET(sockfd, &read_fds)) {
 	                // Data is available on the socket, you can read it.
-	                ssize_t bytesRead = recv(sockfd, buffer, sizeof(buffer), 0);
-	                if (bytesRead > 0) {
+	                ssize_t bytesRead = recv(sockfd, buffer, size_buffer, 0);
+	                if (bytesRead > 8) { // '\0'
 	                    // Handle the received data
 	                    //printf("Received data from the socket: %s\n", buffer);
+	                	//Scan(buffer, timeout.tv_sec, &closure);
 	                    dht_periodic(&buffer, sizeof(buffer),&sa, sizeof(sa),&timeout.tv_sec, callback, &closure);
+	                    dht_nodes(MY_DHT_NODE.sin_family, &good, &dubious, &cached, &incoming);
+	                    if (!bootstrapped && dubious > 0){
+	                    	bootstrapped = true;
+	                    }
 	                } else if (bytesRead == 0) {
 	                    // Connection closed
 	                    printf("Connection closed by the remote host.\n");
 	                    close(sockfd);
 	                    break;
-	                } else {
-	                    perror("recv");
+	                //} else {
+	                //    perror("recv");
 	                }
 	            }
 	        }
+	   	   if (bootstrapped){
 	   	   printw("Good+Dubious->%d\n",dht_nodes(MY_DHT_NODE.sin_family, &good, &dubious, &cached, &incoming));
 	   	   printw("Dubious->%d\n",dubious);
 	   	   printw("Good->%d\n",good);
+	   	   }
 	   	   refresh();
 	   	   if (dubious+good >= 50){
 	   		   dht_search((unsigned char *)(info_hash),port,MY_DHT_NODE.sin_family, callback, &closure);
 	   	   }
+	   	   if ((g+1 < size_possible_nodes && !bootstrapped)){
+	   		   g++;
+	   	   } else if (!bootstrapped && dubious < 0){
+	   		  printw("Could not bootstrap the provided list to kademlia networks :(");
+	   		  break;
+	   	   }
+	   	//buffer.clear()
+	   	memset(buffer, '\0', sizeof(*buffer));
 	    }
 
 	endwin();  // Clean up ncurses
