@@ -29,6 +29,24 @@ THE SOFTWARE.
    improvements to the author. */
 
 /* For memmem. */
+
+char* bootstrap_nodes[] = {
+		"xxx.xxx.xxx.xxx:ppppp",
+		"xxx.xxx.xxx.xxx:ppppp",
+		"xxx.xxx.xxx.xxx:ppppp",
+		"xxx.xxx.xxx.xxx:ppppp",
+		"xxx.xxx.xxx.xxx:ppppp",
+		"xxx.xxx.xxx.xxx:ppppp",
+		"xxx.xxx.xxx.xxx:ppppp",
+		"xxx.xxx.xxx.xxx:ppppp",
+		"xxx.xxx.xxx.xxx:ppppp",
+		"xxx.xxx.xxx.xxx:ppppp",
+		"xxx.xxx.xxx.xxx:ppppp",
+		"xxx.xxx.xxx.xxx:ppppp",
+};
+
+
+
 #define _GNU_SOURCE
 
 #include <stdio.h>
@@ -351,10 +369,6 @@ static time_t token_bucket_time;
 static int token_bucket_tokens;
 
 FILE *dht_debug = NULL;
-
-char* bootstrap_nodes[] = {
-    "Your bootstrap peers here format [ip:port]"
-};
 
 #ifdef __GNUC__
     __attribute__ ((format (printf, 1, 2)))
@@ -2388,10 +2402,10 @@ dht_get_nodes(struct sockaddr_in *sin, int *num)//struct sockaddr_in6 *sin6, int
 
     n = b->nodes;
     while(n && i < *num) {
-        //if(node_good(n)) { //TODO:MODDED TO GRAB ALL NODES. DUBIOUS OR NOT.
+        if(node_good(n)) {
             sin[i] = *(struct sockaddr_in*)&n->ss;
             i++;
-        //}
+        }
         n = n->next;
     }
 
@@ -3192,13 +3206,14 @@ void callback(void* closure, int event, const unsigned char* info_hash, const vo
     }
 }
 
-//int save_bucket() {
-//	struct storage *st;
-    //struct sockaddr_in* MY_DHT_BUCKET;
-    //	MY_DHT_BUCKET = (struct sockaddr_in*)malloc(Good * sizeof(struct sockaddr_in));
+int save_bucket(int Good) {
+	//struct storage *st;
+    struct sockaddr_in* MY_DHT_BUCKET;
+    	MY_DHT_BUCKET = (struct sockaddr_in*)malloc(Good * sizeof(struct sockaddr_in));
 
-    //dht_get_nodes(MY_DHT_BUCKET, &Good); //ipv4 only
+    dht_get_nodes(MY_DHT_BUCKET, &Good); //ipv4 only
 
+    struct in_addr PreviousIP;
 	//st = find_storage(myid);
 
 	//for(int i = 0; i < st->numpeers; i++) {
@@ -3208,15 +3223,22 @@ void callback(void* closure, int event, const unsigned char* info_hash, const vo
 	//	printf("%s:%u\n", ip_str, ntohs(st->peers->port));
 	//}
 
-    //for (int i = 0; i < Good; i++) {
-    //	printf("Node %d --> ",i);
-    //    char ip_str[INET_ADDRSTRLEN];
-    //    inet_ntop(AF_INET, &(MY_DHT_BUCKET[i].sin_addr), ip_str, INET_ADDRSTRLEN);
-    //    printf("%s:%u\n", ip_str, ntohs(MY_DHT_BUCKET[i].sin_port));
-    //}
+    for (int i = 0; i < Good; i++) {
 
-    //return 1;
-//}
+        char ip_str[INET_ADDRSTRLEN];
+        PreviousIP = MY_DHT_BUCKET[i].sin_addr;
+        inet_ntop(AF_INET, &(MY_DHT_BUCKET[i].sin_addr), ip_str, INET_ADDRSTRLEN);
+        if (i > 0 && PreviousIP.s_addr != MY_DHT_BUCKET[i].sin_addr.s_addr){
+        	printf("Node %d --> ",i);
+        	printf("%s:%u\n", ip_str, ntohs(MY_DHT_BUCKET[i].sin_port));
+        } else if (i == 0){
+        	printf("Node %d --> ",i);
+        	printf("%s:%u\n", ip_str, ntohs(MY_DHT_BUCKET[i].sin_port));
+        }
+    }
+
+    return 1;
+}
 
 void ping_all(){
 	int port = 0;
@@ -3466,7 +3488,7 @@ int main(int argc, char* argv[]){
 	                	//Scan(buffer, timeout.tv_sec, &closure);
 	                    dht_periodic(&buffer, sizeof(buffer),&sa, sizeof(sa),&timeout.tv_sec, callback, &closure);
 	                    dht_nodes(MY_DHT_NODE.sin_family, &good, &dubious, &cached, &incoming);
-	                    if (!bootstrapped && dubious > 0){
+	                    if (!bootstrapped){
 	                    	bootstrapped = true;
 	                    }
 	                } else if (bytesRead == 0) {
@@ -3480,9 +3502,12 @@ int main(int argc, char* argv[]){
 	            }
 	        }
 	   	   if (bootstrapped){
-	   	   printw("Good+Dubious->%d\n",dht_nodes(MY_DHT_NODE.sin_family, &good, &dubious, &cached, &incoming));
-	   	   printw("Dubious->%d\n",dubious);
-	   	   printw("Good->%d\n",good);
+	   		   printw("\nGood+Dubious->%d\n",dht_nodes(MY_DHT_NODE.sin_family, &good, &dubious, &cached, &incoming));
+	   		   printw("Dubious->%d\n",dubious);
+	   		   printw("Good->%d\n",good);
+	   		   if (dubious == 0 && good == 0){
+	   			   bootstrapped = false;
+	   		   }
 	   	   }
 	   	   refresh();
 	   	   if (dubious+good >= 50){
@@ -3503,6 +3528,9 @@ int main(int argc, char* argv[]){
 	close(sockfd);
 
 	dht_dump_tables(stdout);
+
+	save_bucket(good+dubious);
+
 	dht_uninit();
 	close(ipv4_socket);
 	close(ipv6_socket);
