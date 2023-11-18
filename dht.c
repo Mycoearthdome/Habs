@@ -30,23 +30,6 @@ THE SOFTWARE.
 
 /* For memmem. */
 
-char* bootstrap_nodes[] = {
-		"xxx.xxx.xxx.xxx:ppppp",
-		"xxx.xxx.xxx.xxx:ppppp",
-		"xxx.xxx.xxx.xxx:ppppp",
-		"xxx.xxx.xxx.xxx:ppppp",
-		"xxx.xxx.xxx.xxx:ppppp",
-		"xxx.xxx.xxx.xxx:ppppp",
-		"xxx.xxx.xxx.xxx:ppppp",
-		"xxx.xxx.xxx.xxx:ppppp",
-		"xxx.xxx.xxx.xxx:ppppp",
-		"xxx.xxx.xxx.xxx:ppppp",
-		"xxx.xxx.xxx.xxx:ppppp",
-		"xxx.xxx.xxx.xxx:ppppp",
-};
-
-
-
 #define _GNU_SOURCE
 
 #include <stdio.h>
@@ -84,8 +67,24 @@ char* bootstrap_nodes[] = {
 #include "string.h"
 #include "unistd.h"
 #include "time.h"
-#include "ncurses.h"
 #include "netdb.h"
+#include "pthread.h"
+#include "sys/epoll.h"
+#include "stdbool.h"
+
+
+struct WorkParams {
+    int ipv4_socket;
+    char bootstrap_node[22];
+    int port;
+    char* filename;
+    char* Searches_filename;
+    char* info_hash;
+    struct sockaddr_in MY_DHT_NODE;
+    unsigned char *myid;
+};
+
+pthread_mutex_t mutex;
 
 #define SHA1_DIGEST_LENGTH 20
 
@@ -232,7 +231,7 @@ struct peer {
 
 /* The maximum number of in-flight queries per search. */
 #ifndef DHT_INFLIGHT_QUERIES
-#define DHT_INFLIGHT_QUERIES 4
+#define DHT_INFLIGHT_QUERIES 40 //4
 #endif
 
 /* The retransmit timeout when performing searches. */
@@ -251,38 +250,38 @@ static struct storage * find_storage(const unsigned char *id);
 static void flush_search_node(struct search_node *n, struct search *sr);
 
 static int send_ping(const struct sockaddr *sa, int salen,
-                     const unsigned char *tid, int tid_len);
+                     const unsigned char *tid, int tid_len, int ipv4_socket, unsigned char* myid);
 static int send_pong(const struct sockaddr *sa, int salen,
-                     const unsigned char *tid, int tid_len);
+                     const unsigned char *tid, int tid_len, int ipv4_socket, unsigned char* myid);
 static int send_find_node(const struct sockaddr *sa, int salen,
                           const unsigned char *tid, int tid_len,
-                          const unsigned char *target, int want, int confirm);
+                          const unsigned char *target, int want, int confirm, int ipv4_socket, unsigned char* myid);
 static int send_nodes_peers(const struct sockaddr *sa, int salen,
                             const unsigned char *tid, int tid_len,
                             const unsigned char *nodes, int nodes_len,
                             const unsigned char *nodes6, int nodes6_len,
                             int af, struct storage *st,
-                            const unsigned char *token, int token_len);
+                            const unsigned char *token, int token_len, int ipv4_socket, unsigned char *myid);
 static int send_closest_nodes(const struct sockaddr *sa, int salen,
                               const unsigned char *tid, int tid_len,
                               const unsigned char *id, int want,
                               int af, struct storage *st,
-                              const unsigned char *token, int token_len);
+                              const unsigned char *token, int token_len, int ipv4_socket, unsigned char *myid);
 static int send_get_peers(const struct sockaddr *sa, int salen,
                           unsigned char *tid, int tid_len,
-                          unsigned char *infohash, int want, int confirm);
+                          unsigned char *infohash, int want, int confirm, int ipv4_socket, unsigned char *myid);
 static int send_announce_peer(const struct sockaddr *sa, int salen,
                               unsigned char *tid, int tid_len,
                               unsigned char *infohas, unsigned short port,
-                              unsigned char *token, int token_len, int confirm);
+                              unsigned char *token, int token_len, int confirm, int ipv4_socket, unsigned char *myid);
 static int send_peer_announced(const struct sockaddr *sa, int salen,
-                               unsigned char *tid, int tid_len);
+                               unsigned char *tid, int tid_len, int ipv4_socket, unsigned char *myid);
 static int send_error(const struct sockaddr *sa, int salen,
                       unsigned char *tid, int tid_len,
-                      int code, const char *message);
+                      int code, const char *message, int ipv4_socket);
 
 static void
-add_search_node(const unsigned char *id, const struct sockaddr *sa, int salen);
+add_search_node(const unsigned char *id, const struct sockaddr *sa, int salen, int ipv4_socket, unsigned char *myid);
 
 #define ERROR 0
 #define REPLY 1
@@ -337,7 +336,7 @@ static time_t search_time;
 static time_t confirm_nodes_time;
 static time_t rotate_secrets_time;
 
-static unsigned char myid[20];
+//static unsigned char myid[20];
 static int have_v = 0;
 static unsigned char my_v[9];
 static unsigned char secret[8];
@@ -355,7 +354,7 @@ static unsigned short search_id;
 /* The maximum number of nodes that we snub.  There is probably little
    reason to increase this value. */
 #ifndef DHT_MAX_BLACKLISTED
-#define DHT_MAX_BLACKLISTED 10
+#define DHT_MAX_BLACKLISTED 10 //10
 #endif
 static struct sockaddr_storage blacklist[DHT_MAX_BLACKLISTED];
 int next_blacklisted;
@@ -379,8 +378,8 @@ debugf(const char *format, ...)
     va_list args;
     va_start(args, format);
     if(dht_debug)
-        //vfprintf(dht_debug, format, args);
-    	wprintw(stdscr, format, args);
+        vfprintf(dht_debug, format, args);
+    	//wprintw(stdscr, format, args);
     va_end(args);
     //if(dht_debug)
         //fflush(dht_debug);
@@ -661,7 +660,7 @@ tid_match(const unsigned char *tid, const char *prefix,
 
 /* Every bucket caches the address of a likely node.  Ping it. */
 static int
-send_cached_ping(struct bucket *b)
+send_cached_ping(struct bucket *b, int ipv4_socket, unsigned char *myid)
 {
     unsigned char tid[4];
     int rc;
@@ -671,7 +670,7 @@ send_cached_ping(struct bucket *b)
 
     debugf("Sending ping to cached node.\n");
     make_tid(tid, "pn", 0);
-    rc = send_ping((struct sockaddr*)&b->cached, b->cachedlen, tid, 4);
+    rc = send_ping((struct sockaddr*)&b->cached, b->cachedlen, tid, 4, ipv4_socket, myid);
     b->cached.ss_family = 0;
     b->cachedlen = 0;
     return rc;
@@ -680,18 +679,18 @@ send_cached_ping(struct bucket *b)
 /* Called whenever we send a request to a node, increases the ping count
    and, if that reaches 3, sends a ping to a new candidate. */
 static void
-pinged(struct node *n, struct bucket *b)
+pinged(struct node *n, struct bucket *b, int ipv4_socket, unsigned char *myid)
 {
     n->pinged++;
     n->pinged_time = now.tv_sec;
     if(n->pinged >= 3)
-        send_cached_ping(b ? b : find_bucket(n->id, n->ss.ss_family));
+        send_cached_ping(b ? b : find_bucket(n->id, n->ss.ss_family), ipv4_socket, myid);
 }
 
 /* The internal blacklist is an LRU cache of nodes that have sent
    incorrect messages. */
 static void
-blacklist_node(const unsigned char *id, const struct sockaddr *sa, int salen)
+blacklist_node(const unsigned char *id, const struct sockaddr *sa, int salen, int ipv4_socket, unsigned char *myid)
 {
     int i;
 
@@ -704,7 +703,7 @@ blacklist_node(const unsigned char *id, const struct sockaddr *sa, int salen)
         n = find_node(id, sa->sa_family);
         if(n) {
             n->pinged = 3;
-            pinged(n, NULL);
+            pinged(n, NULL, ipv4_socket, myid);
         }
         /* Discard it from any searches in progress. */
         sr = searches;
@@ -781,7 +780,7 @@ insert_node(struct node *node, struct bucket **split_return)
 /* Splits a bucket, and returns the list of nodes that must be reinserted
    into the routing table. */
 static int
-split_bucket_helper(struct bucket *b, struct node **nodes_return)
+split_bucket_helper(struct bucket *b, struct node **nodes_return, int ipv4_socket, unsigned char *myid)
 {
     struct bucket *new;
     int rc;
@@ -800,7 +799,7 @@ split_bucket_helper(struct bucket *b, struct node **nodes_return)
     if(new == NULL)
         return -1;
 
-    send_cached_ping(b);
+    send_cached_ping(b, ipv4_socket, myid);
 
     new->af = b->af;
     memcpy(new->first, new_id, 20);
@@ -823,14 +822,14 @@ split_bucket_helper(struct bucket *b, struct node **nodes_return)
 }
 
 static int
-split_bucket(struct bucket *b)
+split_bucket(struct bucket *b, int ipv4_socket, unsigned char *myid)
 {
     int rc;
     struct node *nodes = NULL;
     struct node *n = NULL;
 
     debugf("Splitting.\n");
-    rc = split_bucket_helper(b, &nodes);
+    rc = split_bucket_helper(b, &nodes, ipv4_socket, myid);
     if(rc < 0) {
         debugf("Couldn't split bucket");
         return -1;
@@ -856,7 +855,7 @@ split_bucket(struct bucket *b)
         } else {
             struct node *insert = NULL;
             debugf("Splitting (recursive).\n");
-            rc = split_bucket_helper(split, &insert);
+            rc = split_bucket_helper(split, &insert, ipv4_socket, myid);
             if(rc < 0) {
                 debugf("Couldn't split bucket.\n");
                 free(n);
@@ -873,7 +872,7 @@ split_bucket(struct bucket *b)
    the node sent a message, 2 if it sent us a reply. */
 static struct node *
 new_node(const unsigned char *id, const struct sockaddr *sa, int salen,
-         int confirm)
+         int confirm, int ipv4_socket, unsigned char *myid)
 {
     struct bucket *b;
     struct node *n;
@@ -911,7 +910,7 @@ new_node(const unsigned char *id, const struct sockaddr *sa, int salen,
                 }
             }
             if(confirm == 2)
-                add_search_node(id, sa, salen);
+                add_search_node(id, sa, salen, ipv4_socket, myid);
             return n;
         }
         n = n->next;
@@ -937,7 +936,7 @@ new_node(const unsigned char *id, const struct sockaddr *sa, int salen,
             n->pinged_time = 0;
             n->pinged = 0;
             if(confirm == 2)
-                add_search_node(id, sa, salen);
+                add_search_node(id, sa, salen, ipv4_socket, myid);
             return n;
         }
         n = n->next;
@@ -959,7 +958,7 @@ new_node(const unsigned char *id, const struct sockaddr *sa, int salen,
                     debugf("Sending ping to dubious node.\n");
                     make_tid(tid, "pn", 0);
                     send_ping((struct sockaddr*)&n->ss, n->sslen,
-                              tid, 4);
+                              tid, 4, ipv4_socket, myid);
                     n->pinged++;
                     n->pinged_time = now.tv_sec;
                     break;
@@ -970,7 +969,7 @@ new_node(const unsigned char *id, const struct sockaddr *sa, int salen,
 
         if(mybucket && !dubious) {
             int rc;
-            rc = split_bucket(b);
+            rc = split_bucket(b, ipv4_socket, myid);
             if(rc > 0)
                 goto again;
             return NULL;
@@ -983,7 +982,7 @@ new_node(const unsigned char *id, const struct sockaddr *sa, int salen,
         }
 
         if(confirm == 2)
-            add_search_node(id, sa, salen);
+            add_search_node(id, sa, salen, ipv4_socket, myid);
         return NULL;
     }
 
@@ -1000,7 +999,7 @@ new_node(const unsigned char *id, const struct sockaddr *sa, int salen,
     b->nodes = n;
     b->count++;
     if(confirm == 2)
-        add_search_node(id, sa, salen);
+        add_search_node(id, sa, salen, ipv4_socket, myid);
     return n;
 }
 
@@ -1008,7 +1007,7 @@ new_node(const unsigned char *id, const struct sockaddr *sa, int salen,
    conservative here: broken nodes in the table don't do much harm, we'll
    recover as soon as we find better ones. */
 static int
-expire_buckets(struct bucket *b)
+expire_buckets(struct bucket *b, int ipv4_socket, unsigned char *myid)
 {
     while(b) {
         struct node *n, *p;
@@ -1035,7 +1034,7 @@ expire_buckets(struct bucket *b)
         }
 
         if(changed)
-            send_cached_ping(b);
+            send_cached_ping(b, ipv4_socket, myid);
 
         b = b->next;
     }
@@ -1163,7 +1162,7 @@ expire_searches(dht_callback_t *callback, void *closure)
 
 /* This must always return 0 or 1, never -1, not even on failure (see below). */
 static int
-search_send_get_peers(struct search *sr, struct search_node *n)
+search_send_get_peers(struct search *sr, struct search_node *n, int ipv4_socket, unsigned char *myid)
 {
     struct node *node;
     unsigned char tid[4];
@@ -1184,19 +1183,19 @@ search_send_get_peers(struct search *sr, struct search_node *n)
     debugf("Sending get_peers.\n");
     make_tid(tid, "gp", sr->tid);
     send_get_peers((struct sockaddr*)&n->ss, n->sslen, tid, 4, sr->id, -1,
-                   n->reply_time >= now.tv_sec - DHT_SEARCH_RETRANSMIT);
+                   n->reply_time >= now.tv_sec - DHT_SEARCH_RETRANSMIT, ipv4_socket, myid);
     n->pinged++;
     n->request_time = now.tv_sec;
     /* If the node happens to be in our main routing table, mark it
        as pinged. */
     node = find_node(n->id, n->ss.ss_family);
-    if(node) pinged(node, NULL);
+    if(node) pinged(node, NULL, ipv4_socket, myid);
     return 1;
 }
 
 /* Insert a new node into any incomplete search. */
 static void
-add_search_node(const unsigned char *id, const struct sockaddr *sa, int salen)
+add_search_node(const unsigned char *id, const struct sockaddr *sa, int salen, int ipv4_socket, unsigned char *myid)
 {
     struct search *sr;
     for(sr = searches; sr; sr = sr->next) {
@@ -1204,7 +1203,7 @@ add_search_node(const unsigned char *id, const struct sockaddr *sa, int salen)
             struct search_node *n =
                 insert_search_node(id, sa, salen, sr, 0, NULL, 0);
             if(n)
-                search_send_get_peers(sr, n);
+                search_send_get_peers(sr, n, ipv4_socket, myid);
         }
     }
 }
@@ -1212,7 +1211,7 @@ add_search_node(const unsigned char *id, const struct sockaddr *sa, int salen)
 /* When a search is in progress, we periodically call search_step to send
    further requests. */
 static void
-search_step(struct search *sr, dht_callback_t *callback, void *closure)
+search_step(struct search *sr, dht_callback_t *callback, void *closure, int ipv4_socket, unsigned char *myid)
 {
     int i, j;
     int all_done = 1;
@@ -1256,11 +1255,11 @@ search_step(struct search *sr, dht_callback_t *callback, void *closure)
                                        sizeof(struct sockaddr_storage),
                                        tid, 4, sr->id, sr->port,
                                        n->token, n->token_len,
-                                       n->reply_time >= now.tv_sec - 15);
+                                       n->reply_time >= now.tv_sec - 15, ipv4_socket, myid);
                     n->pinged++;
                     n->request_time = now.tv_sec;
                     node = find_node(n->id, n->ss.ss_family);
-                    if(node) pinged(node, NULL);
+                    if(node) pinged(node, NULL, ipv4_socket, myid);
                 }
                 j++;
             }
@@ -1276,7 +1275,7 @@ search_step(struct search *sr, dht_callback_t *callback, void *closure)
 
     j = 0;
     for(i = 0; i < sr->numnodes; i++) {
-        j += search_send_get_peers(sr, &sr->nodes[i]);
+        j += search_send_get_peers(sr, &sr->nodes[i], ipv4_socket, myid);
         if(j >= DHT_INFLIGHT_QUERIES)
             break;
     }
@@ -1347,7 +1346,7 @@ insert_search_bucket(struct bucket *b, struct search *sr)
    search is complete. */
 int
 dht_search(const unsigned char *id, int port, int af,
-           dht_callback_t *callback, void *closure)
+           dht_callback_t *callback, void *closure, int ipv4_socket, unsigned char *myid)
 {
     struct search *sr;
     struct storage *st;
@@ -1444,7 +1443,7 @@ dht_search(const unsigned char *id, int port, int af,
     if(sr->numnodes < SEARCH_NODES)
         insert_search_bucket(find_bucket(myid, af), sr);
 
-    search_step(sr, callback, closure);
+    search_step(sr, callback, closure, ipv4_socket, myid);
     search_time = now.tv_sec;
     if(sr_duplicate) {
         return 0;
@@ -1640,10 +1639,11 @@ token_match(const unsigned char *token, int token_len,
 
 int
 dht_nodes(int af, int *good_return, int *dubious_return, int *cached_return,
-          int *incoming_return)
+          int *incoming_return, unsigned char *myid)
 {
     int good = 0, dubious = 0, cached = 0, incoming = 0;
-    struct bucket *b = af == AF_INET ? buckets : buckets6;
+    //struct bucket *b = af == AF_INET ? buckets : buckets6;
+    struct bucket *b = find_bucket(myid, AF_INET);
 
     while(b) {
         struct node *n = b->nodes;
@@ -1673,7 +1673,7 @@ dht_nodes(int af, int *good_return, int *dubious_return, int *cached_return,
 }
 
 static void
-dump_bucket(FILE *f, struct bucket *b)
+dump_bucket(FILE *f, struct bucket *b, unsigned char *myid)
 {
     struct node *n = b->nodes;
     fprintf(f, "Bucket ");
@@ -1721,7 +1721,7 @@ dump_bucket(FILE *f, struct bucket *b)
 }
 
 void
-dht_dump_tables(FILE *f)
+dht_dump_tables(FILE *f, unsigned char *myid)
 {
     int i;
     struct bucket *b;
@@ -1734,7 +1734,7 @@ dht_dump_tables(FILE *f)
 
     b = buckets;
     while(b) {
-        dump_bucket(f, b);
+        dump_bucket(f, b, myid);
         b = b->next;
     }
 
@@ -1742,7 +1742,7 @@ dht_dump_tables(FILE *f)
 
     b = buckets6;
     while(b) {
-        dump_bucket(f, b);
+        dump_bucket(f, b, myid);
         b = b->next;
     }
 
@@ -1795,14 +1795,14 @@ dht_dump_tables(FILE *f)
 }
 
 int
-dht_init(int s, int s6, const unsigned char *id, const unsigned char *v)
+dht_init(int s, int s6, const unsigned char *id, const unsigned char *v, int max_count, unsigned char *myid)
 {
     int rc;
 
-    if(dht_socket >= 0 || dht_socket6 >= 0 || buckets || buckets6) {
-        errno = EBUSY;
-        return -1;
-    }
+    //if(dht_socket >= 0 || dht_socket6 >= 0 || buckets || buckets6) {
+    //    errno = EBUSY;
+    //    return -1;
+    //}
 
     searches = NULL;
     numsearches = 0;
@@ -1814,7 +1814,7 @@ dht_init(int s, int s6, const unsigned char *id, const unsigned char *v)
         buckets = calloc(1, sizeof(struct bucket));
         if(buckets == NULL)
             return -1;
-        buckets->max_count = 1280;
+        buckets->max_count = max_count;
         buckets->af = AF_INET;
     }
 
@@ -1822,11 +1822,12 @@ dht_init(int s, int s6, const unsigned char *id, const unsigned char *v)
         buckets6 = calloc(1, sizeof(struct bucket));
         if(buckets6 == NULL)
             return -1;
-        buckets6->max_count = 1280;
+        buckets6->max_count = max_count;
         buckets6->af = AF_INET6;
     }
 
-    memcpy(myid, id, 20);
+    //memcpy(myid, id, 20);
+
     if(v) {
         memcpy(my_v, "1:v4:", 5);
         memcpy(my_v + 5, v, 4);
@@ -1857,8 +1858,8 @@ dht_init(int s, int s6, const unsigned char *id, const unsigned char *v)
     dht_socket = s;
     dht_socket6 = s6;
 
-    expire_buckets(buckets);
-    expire_buckets(buckets6);
+    expire_buckets(buckets, s, myid);
+    expire_buckets(buckets6, s6, myid);
 
     return 1;
 
@@ -1938,7 +1939,7 @@ token_bucket(void)
 }
 
 static int
-neighbourhood_maintenance(int af)
+neighbourhood_maintenance(int af, int ipv4_socket, unsigned char* myid)
 {
     unsigned char id[20];
     struct bucket *b = find_bucket(myid, af);
@@ -1972,8 +1973,8 @@ neighbourhood_maintenance(int af)
             make_tid(tid, "fn", 0);
             send_find_node((struct sockaddr*)&n->ss, n->sslen,
                            tid, 4, id, want,
-                           n->reply_time >= now.tv_sec - 15);
-            pinged(n, q);
+                           n->reply_time >= now.tv_sec - 15, ipv4_socket,myid);
+            pinged(n, q, ipv4_socket, myid);
         }
         return 1;
     }
@@ -1981,7 +1982,7 @@ neighbourhood_maintenance(int af)
 }
 
 static int
-bucket_maintenance(int af)
+bucket_maintenance(int af, int ipv4_socket, unsigned char *myid)
 {
     struct bucket *b;
 
@@ -2044,8 +2045,8 @@ bucket_maintenance(int af)
                     make_tid(tid, "fn", 0);
                     send_find_node((struct sockaddr*)&n->ss, n->sslen,
                                    tid, 4, id, want,
-                                   n->reply_time >= now.tv_sec - 15);
-                    pinged(n, q);
+                                   n->reply_time >= now.tv_sec - 15, ipv4_socket, myid);
+                    pinged(n, q, ipv4_socket, myid);
                     /* In order to avoid sending queries back-to-back,
                        give up for now and reschedule us soon. */
                     return 1;
@@ -2061,7 +2062,7 @@ int
 dht_periodic(const void *buf, size_t buflen,
              const struct sockaddr *from, int fromlen,
              time_t *tosleep,
-             dht_callback_t *callback, void *closure)
+             dht_callback_t *callback, void *closure, int ipv4_socket, unsigned char *myid)
 {
     dht_gettimeofday(&now, NULL);
 
@@ -2116,12 +2117,12 @@ dht_periodic(const void *buf, size_t buflen,
                 /* This is really annoying, as it means that we will
                    time-out all our searches that go through this node.
                    Kill it. */
-                blacklist_node(m.id, from, fromlen);
+                blacklist_node(m.id, from, fromlen, ipv4_socket, myid);
                 goto dontread;
             }
             if(tid_match(m.tid, "pn", NULL)) {
                 debugf("Pong!\n");
-                new_node(m.id, from, fromlen, 2);
+                new_node(m.id, from, fromlen, 2, ipv4_socket, myid);
             } else if(tid_match(m.tid, "fn", NULL) ||
                       tid_match(m.tid, "gp", NULL)) {
                 int gp = 0;
@@ -2135,13 +2136,13 @@ dht_periodic(const void *buf, size_t buflen,
                        gp ? " for get_peers" : "");
                 if(m.nodes_len % 26 != 0 || m.nodes6_len % 38 != 0) {
                     debugf("Unexpected length for node info!\n");
-                    blacklist_node(m.id, from, fromlen);
+                    blacklist_node(m.id, from, fromlen, ipv4_socket, myid);
                 } else if(gp && sr == NULL) {
                     debugf("Unknown search!\n");
-                    new_node(m.id, from, fromlen, 1);
+                    new_node(m.id, from, fromlen, 1, ipv4_socket, myid);
                 } else {
                     int i;
-                    new_node(m.id, from, fromlen, 2);
+                    new_node(m.id, from, fromlen, 2, ipv4_socket, myid);
                     for(i = 0; i < m.nodes_len / 26; i++) {
                         unsigned char *ni = m.nodes + i * 26;
                         struct sockaddr_in sin;
@@ -2151,7 +2152,7 @@ dht_periodic(const void *buf, size_t buflen,
                         sin.sin_family = AF_INET;
                         memcpy(&sin.sin_addr, ni + 20, 4);
                         memcpy(&sin.sin_port, ni + 24, 2);
-                        new_node(ni, (struct sockaddr*)&sin, sizeof(sin), 0);
+                        new_node(ni, (struct sockaddr*)&sin, sizeof(sin), 0, ipv4_socket, myid);
                         if(sr && sr->af == AF_INET) {
                             insert_search_node(ni,
                                                (struct sockaddr*)&sin,
@@ -2168,7 +2169,7 @@ dht_periodic(const void *buf, size_t buflen,
                         sin6.sin6_family = AF_INET6;
                         memcpy(&sin6.sin6_addr, ni + 20, 16);
                         memcpy(&sin6.sin6_port, ni + 36, 2);
-                        new_node(ni, (struct sockaddr*)&sin6, sizeof(sin6), 0);
+                        new_node(ni, (struct sockaddr*)&sin6, sizeof(sin6), 0, ipv4_socket, myid);
                         if(sr && sr->af == AF_INET6) {
                             insert_search_node(ni,
                                                (struct sockaddr*)&sin6,
@@ -2180,7 +2181,7 @@ dht_periodic(const void *buf, size_t buflen,
                         /* Since we received a reply, the number of
                            requests in flight has decreased.  Let's push
                            another request. */
-                        search_send_get_peers(sr, NULL);
+                        search_send_get_peers(sr, NULL, ipv4_socket, myid);
                 }
                 if(sr) {
                     insert_search_node(m.id, from, fromlen, sr,
@@ -2205,10 +2206,10 @@ dht_periodic(const void *buf, size_t buflen,
                 sr = find_search(ttid, from->sa_family);
                 if(!sr) {
                     debugf("Unknown search!\n");
-                    new_node(m.id, from, fromlen, 1);
+                    new_node(m.id, from, fromlen, 1, ipv4_socket, myid);
                 } else {
                     int i;
-                    new_node(m.id, from, fromlen, 2);
+                    new_node(m.id, from, fromlen, 2, ipv4_socket, myid);
                     for(i = 0; i < sr->numnodes; i++)
                         if(id_cmp(sr->nodes[i].id, m.id) == 0) {
                             sr->nodes[i].request_time = 0;
@@ -2218,7 +2219,7 @@ dht_periodic(const void *buf, size_t buflen,
                             break;
                         }
                     /* See comment for gp above. */
-                    search_send_get_peers(sr, NULL);
+                    search_send_get_peers(sr, NULL, ipv4_socket, myid);
                 }
             } else {
                 debugf("Unexpected reply: ");
@@ -2228,25 +2229,25 @@ dht_periodic(const void *buf, size_t buflen,
             break;
         case PING:
             debugf("Ping (%d)!\n", m.tid_len);
-            new_node(m.id, from, fromlen, 1);
+            new_node(m.id, from, fromlen, 1, ipv4_socket, myid);
             debugf("Sending pong.\n");
-            send_pong(from, fromlen, m.tid, m.tid_len);
+            send_pong(from, fromlen, m.tid, m.tid_len, ipv4_socket, myid);
             break;
         case FIND_NODE:
             debugf("Find node!\n");
-            new_node(m.id, from, fromlen, 1);
+            new_node(m.id, from, fromlen, 1, ipv4_socket, myid);
             debugf("Sending closest nodes (%d).\n", m.want);
             send_closest_nodes(from, fromlen,
                                m.tid, m.tid_len, m.target, m.want,
-                               0, NULL, NULL, 0);
+                               0, NULL, NULL, 0, ipv4_socket, myid);
             break;
         case GET_PEERS:
             debugf("Get_peers!\n");
-            new_node(m.id, from, fromlen, 1);
+            new_node(m.id, from, fromlen, 1, ipv4_socket, myid);
             if(id_cmp(m.info_hash, zeroes) == 0) {
                 debugf("Eek!  Got get_peers with no info_hash.\n");
                 send_error(from, fromlen, m.tid, m.tid_len,
-                           203, "Get_peers with no info_hash");
+                           203, "Get_peers with no info_hash", ipv4_socket);
                 break;
             } else {
                 struct storage *st = find_storage(m.info_hash);
@@ -2259,28 +2260,28 @@ dht_periodic(const void *buf, size_t buflen,
                                         m.tid, m.tid_len,
                                         m.info_hash, m.want,
                                         from->sa_family, st,
-                                        token, TOKEN_SIZE);
+                                        token, TOKEN_SIZE, ipv4_socket, myid);
                 } else {
                     debugf("Sending nodes for get_peers.\n");
                     send_closest_nodes(from, fromlen,
                                        m.tid, m.tid_len, m.info_hash, m.want,
-                                       0, NULL, token, TOKEN_SIZE);
+                                       0, NULL, token, TOKEN_SIZE, ipv4_socket, myid);
                 }
             }
             break;
         case ANNOUNCE_PEER:
             debugf("Announce peer!\n");
-            new_node(m.id, from, fromlen, 1);
+            new_node(m.id, from, fromlen, 1, ipv4_socket, myid);
             if(id_cmp(m.info_hash, zeroes) == 0) {
                 debugf("Announce_peer with no info_hash.\n");
                 send_error(from, fromlen, m.tid, m.tid_len,
-                           203, "Announce_peer with no info_hash");
+                           203, "Announce_peer with no info_hash", ipv4_socket);
                 break;
             }
             if(!token_match(m.token, m.token_len, from)) {
                 debugf("Incorrect token for announce_peer.\n");
                 send_error(from, fromlen, m.tid, m.tid_len,
-                           203, "Announce_peer with wrong token");
+                           203, "Announce_peer with wrong token", ipv4_socket);
                 break;
             }
             if(m.implied_port != 0) {
@@ -2297,7 +2298,7 @@ dht_periodic(const void *buf, size_t buflen,
             if(m.port == 0) {
                 debugf("Announce_peer with forbidden port %d.\n", m.port);
                 send_error(from, fromlen, m.tid, m.tid_len,
-                           203, "Announce_peer with forbidden port number");
+                           203, "Announce_peer with forbidden port number", ipv4_socket);
                 break;
             }
             storage_store(m.info_hash, from, m.port);
@@ -2305,7 +2306,7 @@ dht_periodic(const void *buf, size_t buflen,
                This is to prevent them from backtracking, and hence
                polluting the DHT. */
             debugf("Sending peer announced.\n");
-            send_peer_announced(from, fromlen, m.tid, m.tid_len);
+            send_peer_announced(from, fromlen, m.tid, m.tid_len, ipv4_socket, myid);
         }
     }
 
@@ -2314,8 +2315,8 @@ dht_periodic(const void *buf, size_t buflen,
         rotate_secrets();
 
     if(now.tv_sec >= expire_stuff_time) {
-        expire_buckets(buckets);
-        expire_buckets(buckets6);
+        expire_buckets(buckets, ipv4_socket, myid);
+        expire_buckets(buckets6, ipv4_socket, myid);
         expire_storage();
         expire_searches(callback, closure);
     }
@@ -2326,7 +2327,7 @@ dht_periodic(const void *buf, size_t buflen,
         while(sr) {
             if(!sr->done &&
                sr->step_time + DHT_SEARCH_RETRANSMIT / 2 + 1 <= now.tv_sec) {
-                search_step(sr, callback, closure);
+                search_step(sr, callback, closure, ipv4_socket, myid);
             }
             sr = sr->next;
         }
@@ -2348,14 +2349,14 @@ dht_periodic(const void *buf, size_t buflen,
     if(now.tv_sec >= confirm_nodes_time) {
         int soon = 0;
 
-        soon |= bucket_maintenance(AF_INET);
-        soon |= bucket_maintenance(AF_INET6);
+        soon |= bucket_maintenance(AF_INET, ipv4_socket, myid);
+        soon |= bucket_maintenance(AF_INET6,ipv4_socket, myid);
 
         if(!soon) {
             if(mybucket_grow_time >= now.tv_sec - 150)
-                soon |= neighbourhood_maintenance(AF_INET);
+                soon |= neighbourhood_maintenance(AF_INET,ipv4_socket, myid);
             if(mybucket6_grow_time >= now.tv_sec - 150)
-                soon |= neighbourhood_maintenance(AF_INET6);
+                soon |= neighbourhood_maintenance(AF_INET6,ipv4_socket, myid);
         }
 
         /* Given the timeouts in bucket_maintenance, with a 22-bucket
@@ -2386,7 +2387,7 @@ dht_periodic(const void *buf, size_t buflen,
 }
 
 int
-dht_get_nodes(struct sockaddr_in *sin, int *num)//struct sockaddr_in6 *sin6, int *num6)
+dht_get_nodes(struct sockaddr_in *sin, int *num, unsigned char *myid)//struct sockaddr_in6 *sin6, int *num6)
 {
     int i;//, j;
     struct bucket *b;
@@ -2402,10 +2403,10 @@ dht_get_nodes(struct sockaddr_in *sin, int *num)//struct sockaddr_in6 *sin6, int
 
     n = b->nodes;
     while(n && i < *num) {
-        if(node_good(n)) {
+        //if(node_good(n)) {
             sin[i] = *(struct sockaddr_in*)&n->ss;
             i++;
-        }
+        //}
         n = n->next;
     }
 
@@ -2464,7 +2465,7 @@ dht_get_nodes(struct sockaddr_in *sin, int *num)//struct sockaddr_in6 *sin6, int
 }
 
 int
-dht_insert_node(const unsigned char *id, struct sockaddr *sa, int salen)
+dht_insert_node(const unsigned char *id, struct sockaddr *sa, int salen, int ipv4_socket, unsigned char *myid)
 {
     struct node *n;
 
@@ -2473,18 +2474,18 @@ dht_insert_node(const unsigned char *id, struct sockaddr *sa, int salen)
         return -1;
     }
 
-    n = new_node(id, sa, salen, 0);
+    n = new_node(id, sa, salen, 0, ipv4_socket, myid);
     return !!n;
 }
 
 int
-dht_ping_node(const struct sockaddr *sa, int salen)
+dht_ping_node(const struct sockaddr *sa, int salen, int ipv4_socket, unsigned char* myid)
 {
     unsigned char tid[4];
 
     debugf("Sending ping.\n");
     make_tid(tid, "pn", 0);
-    return send_ping(sa, salen, tid, 4);
+    return send_ping(sa, salen, tid, 4, ipv4_socket, myid);
 }
 
 /* We could use a proper bencoding printer and parser, but the format of
@@ -2509,7 +2510,7 @@ dht_ping_node(const struct sockaddr *sa, int salen)
 
 static int
 dht_send(const void *buf, size_t len, int flags,
-         const struct sockaddr *sa, int salen)
+         const struct sockaddr *sa, int salen, int ipv4_socket)
 {
     int s;
 
@@ -2523,7 +2524,7 @@ dht_send(const void *buf, size_t len, int flags,
     }
 
     if(sa->sa_family == AF_INET)
-        s = dht_socket;
+        s = ipv4_socket; //dht_socket;
     else if(sa->sa_family == AF_INET6)
         s = dht_socket6;
     else
@@ -2539,7 +2540,7 @@ dht_send(const void *buf, size_t len, int flags,
 
 int
 send_ping(const struct sockaddr *sa, int salen,
-          const unsigned char *tid, int tid_len)
+          const unsigned char *tid, int tid_len, int ipv4_socket, unsigned char *myid)
 {
     char buf[512];
     int i = 0, rc;
@@ -2550,7 +2551,7 @@ send_ping(const struct sockaddr *sa, int salen,
     COPY(buf, i, tid, tid_len, 512);
     ADD_V(buf, i, 512);
     rc = snprintf(buf + i, 512 - i, "1:y1:qe"); INC(i, rc, 512);
-    return dht_send(buf, i, 0, sa, salen);
+    return dht_send(buf, i, 0, sa, salen, ipv4_socket);
 
  fail:
     errno = ENOSPC;
@@ -2559,7 +2560,7 @@ send_ping(const struct sockaddr *sa, int salen,
 
 int
 send_pong(const struct sockaddr *sa, int salen,
-          const unsigned char *tid, int tid_len)
+          const unsigned char *tid, int tid_len, int ipv4_socket, unsigned char *myid)
 {
     char buf[512];
     int i = 0, rc;
@@ -2569,7 +2570,7 @@ send_pong(const struct sockaddr *sa, int salen,
     COPY(buf, i, tid, tid_len, 512);
     ADD_V(buf, i, 512);
     rc = snprintf(buf + i, 512 - i, "1:y1:re"); INC(i, rc, 512);
-    return dht_send(buf, i, 0, sa, salen);
+    return dht_send(buf, i, 0, sa, salen, ipv4_socket);
 
  fail:
     errno = ENOSPC;
@@ -2579,7 +2580,7 @@ send_pong(const struct sockaddr *sa, int salen,
 int
 send_find_node(const struct sockaddr *sa, int salen,
                const unsigned char *tid, int tid_len,
-               const unsigned char *target, int want, int confirm)
+               const unsigned char *target, int want, int confirm, int ipv4_socket, unsigned char *myid)
 {
     char buf[512];
     int i = 0, rc;
@@ -2598,7 +2599,7 @@ send_find_node(const struct sockaddr *sa, int salen,
     COPY(buf, i, tid, tid_len, 512);
     ADD_V(buf, i, 512);
     rc = snprintf(buf + i, 512 - i, "1:y1:qe"); INC(i, rc, 512);
-    return dht_send(buf, i, confirm ? MSG_CONFIRM : 0, sa, salen);
+    return dht_send(buf, i, confirm ? MSG_CONFIRM : 0, sa, salen, ipv4_socket);
 
  fail:
     errno = ENOSPC;
@@ -2611,7 +2612,7 @@ send_nodes_peers(const struct sockaddr *sa, int salen,
                  const unsigned char *nodes, int nodes_len,
                  const unsigned char *nodes6, int nodes6_len,
                  int af, struct storage *st,
-                 const unsigned char *token, int token_len)
+                 const unsigned char *token, int token_len, int ipv4_socket, unsigned char *myid)
 {
     char buf[2048];
     int i = 0, rc, j0, j, k, len;
@@ -2665,7 +2666,7 @@ send_nodes_peers(const struct sockaddr *sa, int salen,
     ADD_V(buf, i, 2048);
     rc = snprintf(buf + i, 2048 - i, "1:y1:re"); INC(i, rc, 2048);
 
-    return dht_send(buf, i, 0, sa, salen);
+    return dht_send(buf, i, 0, sa, salen, ipv4_socket);
 
  fail:
     errno = ENOSPC;
@@ -2737,7 +2738,7 @@ send_closest_nodes(const struct sockaddr *sa, int salen,
                    const unsigned char *tid, int tid_len,
                    const unsigned char *id, int want,
                    int af, struct storage *st,
-                   const unsigned char *token, int token_len)
+                   const unsigned char *token, int token_len, int ipv4_socket, unsigned char *myid)
 {
     unsigned char nodes[8 * 26];
     unsigned char nodes6[8 * 38];
@@ -2776,13 +2777,13 @@ send_closest_nodes(const struct sockaddr *sa, int salen,
     return send_nodes_peers(sa, salen, tid, tid_len,
                             nodes, numnodes * 26,
                             nodes6, numnodes6 * 38,
-                            af, st, token, token_len);
+                            af, st, token, token_len, ipv4_socket, myid);
 }
 
 int
 send_get_peers(const struct sockaddr *sa, int salen,
                unsigned char *tid, int tid_len, unsigned char *infohash,
-               int want, int confirm)
+               int want, int confirm, int ipv4_socket, unsigned char *myid)
 {
     char buf[512];
     int i = 0, rc;
@@ -2802,7 +2803,7 @@ send_get_peers(const struct sockaddr *sa, int salen,
     COPY(buf, i, tid, tid_len, 512);
     ADD_V(buf, i, 512);
     rc = snprintf(buf + i, 512 - i, "1:y1:qe"); INC(i, rc, 512);
-    return dht_send(buf, i, confirm ? MSG_CONFIRM : 0, sa, salen);
+    return dht_send(buf, i, confirm ? MSG_CONFIRM : 0, sa, salen, ipv4_socket);
 
  fail:
     errno = ENOSPC;
@@ -2813,7 +2814,7 @@ int
 send_announce_peer(const struct sockaddr *sa, int salen,
                    unsigned char *tid, int tid_len,
                    unsigned char *infohash, unsigned short port,
-                   unsigned char *token, int token_len, int confirm)
+                   unsigned char *token, int token_len, int confirm, int ipv4_socket, unsigned char *myid)
 {
     char buf[512];
     int i = 0, rc;
@@ -2832,7 +2833,7 @@ send_announce_peer(const struct sockaddr *sa, int salen,
     ADD_V(buf, i, 512);
     rc = snprintf(buf + i, 512 - i, "1:y1:qe"); INC(i, rc, 512);
 
-    return dht_send(buf, i, confirm ? 0 : MSG_CONFIRM, sa, salen);
+    return dht_send(buf, i, confirm ? 0 : MSG_CONFIRM, sa, salen, ipv4_socket);
 
  fail:
     errno = ENOSPC;
@@ -2841,7 +2842,7 @@ send_announce_peer(const struct sockaddr *sa, int salen,
 
 static int
 send_peer_announced(const struct sockaddr *sa, int salen,
-                    unsigned char *tid, int tid_len)
+                    unsigned char *tid, int tid_len, int ipv4_socket, unsigned char *myid)
 {
     char buf[512];
     int i = 0, rc;
@@ -2853,7 +2854,7 @@ send_peer_announced(const struct sockaddr *sa, int salen,
     COPY(buf, i, tid, tid_len, 512);
     ADD_V(buf, i, 512);
     rc = snprintf(buf + i, 512 - i, "1:y1:re"); INC(i, rc, 512);
-    return dht_send(buf, i, 0, sa, salen);
+    return dht_send(buf, i, 0, sa, salen, ipv4_socket);
 
  fail:
     errno = ENOSPC;
@@ -2863,7 +2864,7 @@ send_peer_announced(const struct sockaddr *sa, int salen,
 static int
 send_error(const struct sockaddr *sa, int salen,
            unsigned char *tid, int tid_len,
-           int code, const char *message)
+           int code, const char *message, int ipv4_socket)
 {
     char buf[512];
     int i = 0, rc, message_len;
@@ -2876,7 +2877,7 @@ send_error(const struct sockaddr *sa, int salen,
     COPY(buf, i, tid, tid_len, 512);
     ADD_V(buf, i, 512);
     rc = snprintf(buf + i, 512 - i, "1:y1:ee"); INC(i, rc, 512);
-    return dht_send(buf, i, 0, sa, salen);
+    return dht_send(buf, i, 0, sa, salen, ipv4_socket);
 
  fail:
     errno = ENOSPC;
@@ -3098,7 +3099,11 @@ parse_message(const unsigned char *buf, int buflen,
 
 int dht_sendto(int sockfd, const void *buf, int len, int flags,
                const struct sockaddr *to, int tolen){
-	return sendto(sockfd, buf, len, flags, to, tolen);
+	pthread_mutex_lock(&mutex);
+	int ret_value = sendto(sockfd, buf, len, flags, to, tolen);
+	pthread_mutex_unlock(&mutex);
+
+	return ret_value;
 }
 
 int dht_blacklisted(const struct sockaddr *sa, int salen){
@@ -3143,13 +3148,28 @@ void dht_hash(void *hash_return, int hash_size,
     }
 }
 
+///////////////MY STUFF BELOW
+
 int create_ipv4_socket() {
     int ipv4_socket = socket(AF_INET, SOCK_DGRAM, 0);
     if (ipv4_socket == -1) {
         perror("socket (IPv4)");
         exit(EXIT_FAILURE);
     }
-    fcntl(ipv4_socket, F_SETFL, O_NONBLOCK);
+    //fcntl(ipv4_socket, F_SETFL, O_NONBLOCK);
+
+    /*// Set the socket to non-blocking mode
+    int flags = fcntl(ipv4_socket, F_GETFL, 0);
+    if (flags == -1) {
+        perror("Error getting socket flags");
+        exit(EXIT_FAILURE);
+    }
+
+    if (fcntl(ipv4_socket, F_SETFL, flags | O_NONBLOCK) == -1) {
+        perror("Error setting non-blocking mode");
+        exit(EXIT_FAILURE);
+    }*/
+
     return ipv4_socket;
 }
 
@@ -3163,8 +3183,152 @@ int create_ipv6_socket() {
     return ipv6_socket;
 }
 
+
+// Structure for a node in the hash set
+struct HashSetNode {
+    char *key;
+    struct HashSetNode *next;
+};
+
+// Structure for the hash set
+struct HashSet {
+    int size;
+    struct HashSetNode **table;
+};
+
+// Function to initialize a hash set
+struct HashSet *createHashSet(int size) {
+    struct HashSet *set = (struct HashSet *)malloc(sizeof(struct HashSet));
+    set->size = size;
+    set->table = (struct HashSetNode **)malloc(sizeof(struct HashSetNode *) * size);
+
+    for (int i = 0; i < size; i++) {
+        set->table[i] = NULL;
+    }
+
+    return set;
+}
+
+unsigned long hash_djb2(char *str) {
+    unsigned long hash = 5381;
+    int c;
+
+    while ((c = *str++)) {
+        hash = ((hash << 5) + hash) + c; // hash * 33 + c
+    }
+
+    return hash;
+}
+
+// Function to calculate the hash value of a string
+int hash(char *key, int size) {
+    return hash_djb2(key) % size;
+}
+
+
+// Function to insert a key into the hash set
+void insertHashSet(struct HashSet *set, char *key) {
+    int index = hash(key, set->size);
+
+    // Duplicate the key before inserting into the hash set
+    char *keyCopy = strdup(key);
+
+    struct HashSetNode *newNode = (struct HashSetNode *)malloc(sizeof(struct HashSetNode));
+    newNode->key = keyCopy;
+    newNode->next = set->table[index];
+    set->table[index] = newNode;
+}
+
+
+// Function to check if a key is already in the hash set
+int containsHashSet(struct HashSet *set, char *key) {
+    int index = hash(key, set->size);
+    struct HashSetNode *current = set->table[index];
+
+    while (current != NULL) {
+        if (strcmp(current->key, key) == 0) {
+            return 1; // Key found
+        }
+        current = current->next;
+    }
+
+    return 0; // Key not found
+}
+
+void freeHashSet(struct HashSet *set) {
+    for (int i = 0; i < set->size; i++) {
+        struct HashSetNode *current = set->table[i];
+        while (current != NULL) {
+            struct HashSetNode *temp = current;
+            current = current->next;
+            free(temp->key); // Free the duplicated string
+            free(temp);
+        }
+    }
+    free(set->table);
+    free(set);
+}
+
+
+// Function to remove duplicates from an unsorted array of strings
+int removeDuplicates(char *array[], int n) {
+    struct HashSet *set = createHashSet(n);
+    int index = 0;
+
+    // Allocate memory for a temporary array of pointers
+    char **temp_array = (char **)malloc(n * sizeof(char *));
+    if (temp_array == NULL) {
+        fprintf(stderr, "Error: Memory allocation failed\n");
+        exit(EXIT_FAILURE);
+    }
+
+    for (int i = 0; i < n; i++) {
+        if (!containsHashSet(set, array[i])) {
+            // Insert the unique element into the hash set
+            insertHashSet(set, array[i]);
+            // Move the unique element to the next position in temp_array
+            temp_array[index] = array[i];
+            index++;
+        }
+    }
+
+    // Free memory used by the hash set
+    freeHashSet(set);
+    set = NULL;
+
+    // Resize the input array to the actual number of unique elements
+    temp_array = (char **)realloc(temp_array, index * sizeof(char *));
+    if (temp_array != NULL) {
+        // Update array to point to the resized memory block
+        **array = **temp_array;
+    } else {
+        // Handle realloc failure, e.g., print an error message and exit or return an error code.
+        fprintf(stderr, "Error: Memory reallocation failed\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Copy elements from temp_array to the resized array
+    for (int i = 0; i < index; i++) {
+        array[i] = temp_array[i];
+    }
+
+    // Free memory used by temp_array
+    free(temp_array);
+
+    return index;
+}
+
+
+void sleepMilliseconds(int milliseconds) {
+    struct timespec sleepTime;
+    sleepTime.tv_sec = milliseconds / 1000;
+    sleepTime.tv_nsec = (milliseconds % 1000) * 1000000;
+    nanosleep(&sleepTime, NULL);
+}
+
+
 unsigned char* generate_nodeID() {
-    srand((unsigned int)time(NULL)); // Seed the random number generator
+	srand((unsigned int)time(NULL)); // Seed the random number generator
     unsigned char* node_id = (unsigned char*)malloc(20);
     unsigned char* hex_id = (unsigned char*)malloc(20);
 
@@ -3183,356 +3347,624 @@ unsigned char* generate_nodeID() {
 
     free(hex_id);
 
+    sleepMilliseconds(1000);
+
     return node_id;
 }
 
 void callback(void* closure, int event, const unsigned char* info_hash, const void* data, size_t data_size) {
-    printw("Callback called with event: %d\n", event);
-    printw("Closure value: %p\n", closure);
+    printf("Callback called with event: %d\n", event);
+    printf("Closure value: %p\n", closure);
 
     // Print the info_hash
-    printw("Info-hash: ");
+    printf("Info-hash: ");
     for (size_t i = 0; i < 20; i++) {
-        printw("%02x", info_hash[i]);
+        printf("%02x", info_hash[i]);
     }
-    printw("\n");
+    printf("\n");
 
     if (event == 1) {
-        printw("Received data: ");
+        printf("Received data: ");
         for (size_t i = 0; i < data_size; i++) {
-            printw("%02x ", ((unsigned char*)data)[i]);
+            printf("%02x ", ((unsigned char*)data)[i]);
         }
-        printw("\n");
+        printf("\n");
     }
 }
 
-int save_bucket(int Good) {
-	//struct storage *st;
-    struct sockaddr_in* MY_DHT_BUCKET;
-    	MY_DHT_BUCKET = (struct sockaddr_in*)malloc(Good * sizeof(struct sockaddr_in));
+char* itoa(int num) {
+    int i = 0;
+    int isNegative = 0;
 
-    dht_get_nodes(MY_DHT_BUCKET, &Good); //ipv4 only
-
-    struct in_addr PreviousIP;
-	//st = find_storage(myid);
-
-	//for(int i = 0; i < st->numpeers; i++) {
-	//	printf("Node %d --> ",i);
-	//	char ip_str[INET_ADDRSTRLEN];
-	//	inet_ntop(AF_INET, st->peers[i].ip, ip_str, INET_ADDRSTRLEN);
-	//	printf("%s:%u\n", ip_str, ntohs(st->peers->port));
-	//}
-
-    for (int i = 0; i < Good; i++) {
-
-        char ip_str[INET_ADDRSTRLEN];
-        PreviousIP = MY_DHT_BUCKET[i].sin_addr;
-        inet_ntop(AF_INET, &(MY_DHT_BUCKET[i].sin_addr), ip_str, INET_ADDRSTRLEN);
-        if (i > 0 && PreviousIP.s_addr != MY_DHT_BUCKET[i].sin_addr.s_addr){
-        	printf("Node %d --> ",i);
-        	printf("%s:%u\n", ip_str, ntohs(MY_DHT_BUCKET[i].sin_port));
-        } else if (i == 0){
-        	printf("Node %d --> ",i);
-        	printf("%s:%u\n", ip_str, ntohs(MY_DHT_BUCKET[i].sin_port));
-        }
+    // Handle the case of a negative number
+    if (num < 0) {
+        isNegative = 1;
+        num = -num;
     }
 
-    return 1;
-}
+    // Calculate the number of digits in the converted string
+    int temp = num;
+    while (temp) {
+        temp /= 10;
+        i++;
+    }
 
-void ping_all(){
-	int port = 0;
-	struct sockaddr_in tracker;
-	struct hostent *hostinfo;
-	struct in_addr *address;
+    // Handle the special case of 0
+    if (num == 0) {
+        char* str = (char*)malloc(2 * sizeof(char));
+        if (str == NULL) {
+            return NULL; // Memory allocation failed
+        }
+        str[0] = '0';
+        str[1] = '\0';
+        return str;
+    }
+
+    // Allocate memory for the string representation
+    char* str = (char*)malloc((i + 2 + isNegative) * sizeof(char));
+    if (str == NULL) {
+        return NULL; // Memory allocation failed
+    }
+
+    // Convert the number to a string in base 10
+    i = 0;
+    while (num != 0) {
+        int digit = num % 10;
+        str[i++] = digit + '0';
+        num /= 10;
+    }
+
+    // Add a negative sign if needed
+    if (isNegative) {/*struct sockaddr_in tracker;
 	struct sockaddr sa;
-
-	char *hostname;
 	char *ip;
 
-	int size = sizeof(bootstrap_nodes) / sizeof(bootstrap_nodes[0]);
+	int PreviousNodesCount = 0;
+	int Timeout = 0;
+	int Max_Timeout = 20; //adjust this as necessary.
+	int size_buffer = 65535; //the size of the buffer.
 
-	for (int i=0;i<size;i++){
-		char *token;
-		char *current_node = strdup(bootstrap_nodes[i]);
-		token = strtok(current_node, ":");
 
-		if (token != NULL) {
+	char buffer[size_buffer];
+	int closure;
 
-			hostname = token; // Get the first token as the IP address
 
-			token = strtok(NULL, ":"); // Get the next token (port)
+	int good = 0, dubious = 0, cached = 0, incoming = 0;
 
-			if (token != NULL) {
-				port = atoi(token); // Convert the port token to an integer
-			}
+	bool bootstrapped = false;
+	*/
+        str[i++] = '-';
+    }
+
+    str[i] = '\0';
+
+    // Reverse the string
+    int start = 0;
+    int end = i - 1;
+    while (start < end) {
+        char temp = str[start];
+        str[start] = str[end];
+        str[end] = temp;
+        start++;
+        end--;
+    }
+
+    return str;
+}
+
+char *BEncode(char* pairs[], int n){
+	    struct ipPort {
+			char *ip;
+			char *port;
+		};
+	    struct ipPort *data = malloc(n * sizeof(struct ipPort));
+		for (int i = 0; i < n; i++) {
+			char *token  = strtok(pairs[i], ",");
+			data[i].ip = strdup(token);
+			data[i].port = strdup(strtok(NULL, ","));
+
+			// Access and print the values
+			//printf("Pair %d/%d: IP: %s Port: %s\n", i ,n, data[i].ip, data[i].port);
 		}
-		printf("Pinging...%s\n", hostname);
-		hostinfo = gethostbyname(hostname);
-		address = (struct in_addr *) (hostinfo->h_addr);
+		char* prefix = "5:nodesd";
+		char *BEncoded = (char *)malloc(strlen(prefix) + 1);
+		strcpy(BEncoded,prefix);
+		for (int i=0;i<n;i++){
+			size_t initial_size;
+			// Calculate the initial size based on the lengths of the strings
+			if (i < 10){
+				initial_size = 4 + strlen(itoa(strlen(data[i].ip))) + 3 + strlen(data[i].ip) + 1 + strlen(data[i].port) + 2;
+			} else if (i < 100){
+				initial_size = 5 + strlen(itoa(strlen(data[i].ip))) + 3 + strlen(data[i].ip) + 1 + strlen(data[i].port) + 2;
+			} else if (i < 1000){
+				initial_size = 6 + strlen(itoa(strlen(data[i].ip))) + 3 + strlen(data[i].ip) + 1 + strlen(data[i].port) + 2;
+			}
+			// Allocate memory for the buffer
+			size_t new_size = sizeof(char) * ((strlen(BEncoded) + initial_size + 1));
+			char* new_buffer = (char *)realloc(BEncoded, new_size);
 
-		ip = inet_ntoa(*address);
+			strcat(new_buffer, itoa(strlen(itoa(i))));
+			strcat(new_buffer, ":");
+			strcat(new_buffer, itoa(i));
+			strcat(new_buffer, "l");
+			strcat(new_buffer, itoa(strlen(data[i].ip)));
+			strcat(new_buffer, ":");
+			strcat(new_buffer, data[i].ip);
+			strcat(new_buffer, "i");
+			strcat(new_buffer, data[i].port);
+			strcat(new_buffer, "ee");
+
+			BEncoded = new_buffer;
+		}
+
+		// Allocate memory for the buffer
+		size_t new_size = sizeof(char) * ((strlen(BEncoded) + 2));
+		char* new_buffer = (char *)realloc(BEncoded, new_size);
+
+		strcat(new_buffer, "e\0");
+
+		BEncoded = new_buffer;
+
+		return BEncoded;
+}
+
+int save_bucket(char *filename, int Good, unsigned char *myid) {
+	FILE *file;
+    struct sockaddr_in* MY_DHT_BUCKET;
+    	MY_DHT_BUCKET = (struct sockaddr_in*)malloc(Good * sizeof(struct sockaddr_in));
+    dht_get_nodes(MY_DHT_BUCKET, &Good, myid); //ipv4 only
+
+    char buffer[30];
+	///////////////////////////////////////////////TODO:REMOVE DUPLICATES.
+    int port;
+    char port_str[6];
+    struct in_addr PreviousIP;
+    int len = 0;
+    printf("-==New BOOTSTRAP Nodes...==-\n\n");
+    file = fopen(filename, "a");
+    for (int i = 0; i < Good; i++) {
+    	port = ntohs(MY_DHT_BUCKET[i].sin_port);
+    	sprintf(port_str, "%d",port);
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &(MY_DHT_BUCKET[i].sin_addr), ip_str, INET_ADDRSTRLEN);
+        if (i > 0  && PreviousIP.s_addr != MY_DHT_BUCKET[i].sin_addr.s_addr && port > 0){ //&& PreviousIP.s_addr != MY_DHT_BUCKET[i].sin_addr.s_addr
+        	printf("\"%s:%d\",\n", ip_str, port);
+        	//strcat(buffer,"\"");
+        	strcat(buffer, ip_str);
+        	strcat(buffer, ",");
+        	strcat(buffer, port_str);
+        	strcat(buffer, ",");
+            //pairs[i] = strdup(buffer);
+            memset(&buffer, 0, sizeof(buffer)); //reset
+            strcat(buffer, ip_str);
+            strcat(buffer, ":");
+            strcat(buffer, port_str);
+            fprintf(file, "%s\n", buffer);
+            len++;
+        } else if (i == 0){
+        	printf("\"%s:%d\",\n", ip_str, port);
+        	//strcat(buffer,"\"");
+        	strcat(buffer, ip_str);
+        	strcat(buffer, ",");
+        	strcat(buffer, port_str);
+        	strcat(buffer, ",");
+            //pairs[i] = strdup(buffer);
+            memset(&buffer, 0, sizeof(buffer)); //reset
+            strcat(buffer, ip_str);
+            strcat(buffer, ":");
+            strcat(buffer, port_str);
+            fprintf(file, "%s\n", buffer);
+            len++;
+
+        PreviousIP = MY_DHT_BUCKET[i].sin_addr;
+
+        }
+        //printf("%s\n",buffer);
+        memset(&buffer, 0, sizeof(buffer)); //reset
+    }
+    fclose(file);
+
+    return 0;
+}
+
+
+char** loadBootstrapNodes(const char *filename, char* bootstrap_nodes[]) {
+    FILE *file = fopen(filename, "r");
+
+    if (file == NULL) {
+        fprintf(stderr, "Error opening file: %s\n", filename);
+        exit(EXIT_FAILURE);  // Exit with an error code
+    }
+
+    int i = 0;
+    char line[100];  // Adjust the buffer size as needed
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+        // Remove newline character from the end of the line
+        size_t length = strlen(line);
+        if (length > 0 && line[length - 1] == '\n') {
+            line[length - 1] = '\0';
+        }
+
+        // Allocate memory for the node and copy the data
+        bootstrap_nodes[i] = strdup(line);
+
+        if (bootstrap_nodes[i] == NULL) {
+            fprintf(stderr, "Error allocating memory.\n");
+            exit(EXIT_FAILURE);  // Exit with an error code
+        }
+
+        i++;
+    }
+
+    fclose(file);
+
+    return bootstrap_nodes;
+}
+
+char** loadSearchesNodes(const char *filename, char* searches_nodes[]) {
+    FILE *file = fopen(filename, "r");
+
+    if (file == NULL) {
+        fprintf(stderr, "Error opening file: %s\n", filename);
+        exit(EXIT_FAILURE);  // Exit with an error code
+    }
+
+    int i = 0;
+    char line[100];  // Adjust the buffer size as needed
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+        // Remove newline character from the end of the line
+        size_t length = strlen(line);
+        if (length > 0 && line[length - 1] == '\n') {
+            line[length - 1] = '\0';
+        }
+
+        // Allocate memory for the node and copy the data
+        searches_nodes[i] = strdup(line);
+
+        if (searches_nodes[i] == NULL) {
+            fprintf(stderr, "Error allocating memory.\n");
+            exit(EXIT_FAILURE);  // Exit with an error code
+        }
+
+        i++;
+    }
+
+    fclose(file);
+
+    return searches_nodes;
+}
+
+int CountLinesFilename(char *filename){
+	FILE *file;
+	int lines = 0;
+	char ch;
+
+	// Open the file in read mode
+	    file = fopen(filename, "r");
+
+	    // If the file is successfully opened
+	    if (file != NULL) {
+	        // Read the file character by character
+	        while ((ch = fgetc(file)) != EOF) {
+	            // If the character is a newline, increment the line count
+	            if (ch == '\n') {
+	                lines++;
+	            }
+	        }
+	    }
+
+	    // Close the file
+	    fclose(file);
+	    return lines;
+}
+
+void SaveMatchSearches(char *filename)
+{
+	FILE *f;
+    int i;
+    struct search *sr = searches;
+
+    f = fopen(filename, "a");
+
+    while(sr) {
+            //print_hex(f, sr->id, 20);
+            for(i = 0; i < sr->numnodes; i++) {
+                struct search_node *sn = &sr->nodes[i];
+                struct bucket *b;
+                b = buckets;
+                //fprintf(f, "Node %d id ", i);
+				while(b) {
+					struct node *bn = b->nodes;
+					while(bn) {
+						char buf[512];
+						unsigned short port;
+						if (strcmp((char *)(sn->id),(char *)(bn->id)) == 0){
+							if(bn->ss.ss_family == AF_INET) {
+								struct sockaddr_in *sin = (struct sockaddr_in*)&bn->ss;
+								inet_ntop(AF_INET, &sin->sin_addr, buf, 512);
+								port = ntohs(sin->sin_port);
+								fprintf(f,"%s,%d,\n", buf, port);
+								break;
+							}
+						}
+						bn = bn->next;
+					}
+					b = b->next;
+				}
+            }
+            sr = sr->next;
+        }
+    fclose(f);
+}
+
+void *work(pthread_mutex_t *mutex, int ipv4_socket, char *bootstrap_node, int port, char *filename, char *Searches_filename, char* info_hash, struct sockaddr_in MY_DHT_NODE, unsigned char *myid){
+		struct timeval timeout;
+		struct sockaddr sa;
+		char bootstrapIP[16];
+		int sockfd;
+		struct sockaddr_in tracker;
+		int dst_port;
+		#define MAX_EVENTS 10
+
+		// Initialize read_fds
+		fd_set read_fds;
+		FD_ZERO(&read_fds);
+		FD_SET(ipv4_socket, &read_fds);
+
+		int PreviousNodesCount = 0;
+		int Timeout = 0;
+		int Max_Timeout = 400; //adjust this as necessary.
+		int size_buffer = 65535; //the size of the buffer.
+
+		char buffer[size_buffer];
+		int closure;
+
+		int good = 0, dubious = 0, cached = 0, incoming = 0;
+		bool bootstrapped = false;
+
+		char *token;
+		char *current_node = bootstrap_node;
+		token = strtok(current_node, ":");
+		if (token != NULL) {
+				strncpy(bootstrapIP, token, INET_ADDRSTRLEN);
+				token = strtok(NULL, ":"); // Get the next token (port)
+				if (token != NULL) {
+					dst_port = atoi(token); // Convert the port token to an integer
+				}
+		}
 
 		tracker.sin_family = AF_INET;
-		tracker.sin_port = htons(port);
-		inet_pton(AF_INET, ip, &(tracker.sin_addr));
-
+		tracker.sin_port = htons(dst_port);
+		inet_pton(AF_INET, bootstrapIP, &tracker.sin_addr);
 		memcpy(&sa, &tracker, sizeof(tracker));
 
-		//char ip_address[INET_ADDRSTRLEN];
-		// Convert the binary IP address to a human-readable string
-		//inet_ntop(AF_INET, &(tracker.sin_addr), ip_address, INET_ADDRSTRLEN);
 
-		dht_ping_node(&sa, sizeof(sa));
-	}
-}
+		int epoll_fd = epoll_create1(0);
+		if (epoll_fd == -1) {
+		    perror("epoll_create1");
+		    exit(EXIT_FAILURE);
+		}
 
-void Scan(char *buffer, time_t sleep_timer, int *closure){
-		printw("SCANNING...\n");
-		int port = 0;
+		struct epoll_event event;
+		event.events = EPOLLIN; //| EPOLLET;
+		event.data.fd = ipv4_socket;
 
-		struct sockaddr_in tracker;
-		struct hostent *hostinfo;
-		struct in_addr *address;
+		if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ipv4_socket, &event) == -1) {
+		    perror("epoll_ctl");
+		    exit(EXIT_FAILURE);
+		}
 
-		char *hostname;
-		char *ip;
-		//int i = 0;
+		struct epoll_event events[MAX_EVENTS];
 
-		int size = sizeof(bootstrap_nodes) / sizeof(bootstrap_nodes[0]);
+		while (Timeout <= Max_Timeout){
 
-		for (int i=0;i<size;i++){
-			char *token;
-			char *current_node = strdup(bootstrap_nodes[i]);
-			token = strtok(current_node, ":");
-
-			if (token != NULL) {
-
-				hostname = token; // Get the first token as the IP address
-
-				token = strtok(NULL, ":"); // Get the next token (port)
-
-				if (token != NULL) {
-					port = atoi(token); // Convert the port token to an integer
-				}
+			if (!bootstrapped){
+				dht_ping_node(&sa, sizeof(sa), ipv4_socket, myid);
 			}
 
-			hostinfo = gethostbyname(hostname);
-			address = (struct in_addr *) (hostinfo->h_addr);
+		   //char* info_hash =  "f1fa38021f9831440ae4fdc177872cc34a5ac7fc";// - linuxmint-21.2-cinnamon-64bit.iso
 
-			ip = inet_ntoa(*address);
+		   // Generate a random timeout value in the range of 30 to ~60 seconds
+		   timeout.tv_sec = (int)(1 + rand() % 12);
+		   closure = (int)(1 + rand() % 65534);
+		   timeout.tv_usec = 0;
+		   int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000); //-1 infinite 0 = non-blocking. ....in milliseconds.
+		       if (nfds == -1) {
+		           perror("epoll_wait");
+		           exit(EXIT_FAILURE);
+		       }
+		   for (int i = 0; i < nfds; ++i) {
+			   if (events[i].data.fd == ipv4_socket) {
+				   	   //int result_ipv4 = select(ipv4_socket + 1, &read_fds, NULL, NULL, &timeout); // replaced by epoll
+				   	   //int result_ipv6 = select(ipv6_socket + 1, &read_fds, NULL, NULL, &timeout); // replaced by epoll
+		        	sockfd = ipv4_socket;
+		            if (FD_ISSET(sockfd, &read_fds)) {
+							ssize_t bytesRead = recv(sockfd, buffer, sizeof(buffer), 0);
+							if (bytesRead > 8) { // '\0'
+								dht_periodic(&buffer, sizeof(buffer),&sa, sizeof(sa),&timeout.tv_sec, callback, &closure, ipv4_socket, myid);
+								dht_nodes(MY_DHT_NODE.sin_family, &good, &dubious, &cached, &incoming, myid);
+								printf("Total: %d\n", good+dubious);
+								printf("Dubious:%d\n", dubious);
+								printf("Good: %d\n", good);
+								if ((!bootstrapped) && (good > 0)){
+									bootstrapped = true;
+									Timeout = Max_Timeout / 2; //500
+								} else if (good+dubious > 8 && good+dubious >PreviousNodesCount){
+									Timeout = Max_Timeout / 2; //500
+								}
+							}
+		            }
+		        }
+		   }
+		   if (nfds == 0){
+			   dht_periodic(&buffer, 0,&sa, sizeof(sa),&timeout.tv_sec, callback, &closure, ipv4_socket, myid);
+		   }
+	   	   if (bootstrapped){
+	   		   if (dubious == 0 && good == 0){
+	   			   bootstrapped = false;
+	   		   } else if (dubious == 1 && good ==0){
+	   			   dubious = 0;
+	   			   bootstrapped = false;
+	   		   }
+	   	   }
+	   	   if (dubious+good >= 9){ //adjust this as necessary.
+	   		   dht_search((unsigned char *)(info_hash),port,MY_DHT_NODE.sin_family, callback, &closure, ipv4_socket, myid);
+	   	   }
+	   	   if ((dubious+good) == PreviousNodesCount){
+	   		   printf("%s-->%d ID= %s\n",current_node, Timeout, myid);
+	   		   Timeout++;
+	   	   }
+	  	   PreviousNodesCount = dubious+good;
 
-			tracker.sin_family = AF_INET;
-			tracker.sin_port = htons(port);
-			inet_pton(AF_INET, ip, &(tracker.sin_addr));
+	}
 
-			struct sockaddr sa;
-				memcpy(&sa, &tracker, sizeof(tracker));
 
-			//char ip_address[INET_ADDRSTRLEN];
-			// Convert the binary IP address to a human-readable string
-			//inet_ntop(AF_INET, &(tracker.sin_addr), ip_address, INET_ADDRSTRLEN);
+		//dht_dump_tables(stdout);
 
-            if (sizeof(*buffer) == 1){
-            	dht_periodic(buffer, 0,&sa, sizeof(sa),&sleep_timer, callback, closure);
-            } else{
-				dht_periodic(buffer, sizeof(*buffer),&sa, sizeof(sa),&sleep_timer, callback, closure);
-            }
-		}
+		save_bucket(filename, dubious+good, myid);
+
+		SaveMatchSearches(Searches_filename);
+
+		close(epoll_fd);
+
+		return NULL;
 }
+
+void* thread_function(void* arg) {
+    struct WorkParams* params = (struct WorkParams*)arg;
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+
+    // Call your actual work function with the provided arguments
+    work(&mutex, params->ipv4_socket, params->bootstrap_node, params->port, params->filename, params->Searches_filename, params->info_hash, params->MY_DHT_NODE, params->myid);
+     // Don't forget to free the memory allocated for params
+    //free(params);
+
+    return NULL;
+}
+
 
 int main(int argc, char* argv[]){
 
 	//dht_debug = stdout;
 
-	int port = 6881;
-	struct timeval timeout;
+	char *filename = "DHT_NODES.txt";
 
+	char *Searches_filename = "DHT_Searches.txt";
 
-	int ipv4_socket = create_ipv4_socket();
-	int ipv6_socket = create_ipv6_socket();
-	int sockfd;
-	fd_set read_fds;
+	char* info_hash =  "f1fa38021f9831440ae4fdc177872cc34a5ac7fc";
 
-	struct sockaddr_in MY_DHT_NODE;
-	    memset(&MY_DHT_NODE, 0, sizeof(MY_DHT_NODE));
+	pthread_mutex_init(&mutex, NULL);
 
+	int numlines = CountLinesFilename(filename);
 
-	    MY_DHT_NODE.sin_family = AF_INET;
-	    MY_DHT_NODE.sin_port = htons(port);
-	    MY_DHT_NODE.sin_addr.s_addr = INADDR_ANY; // Bind to all available network interfaces
+	//char search_term[1024];
 
-	    // Bind the socket to the specified port and address
-	    if (bind(ipv4_socket, (struct sockaddr *)&MY_DHT_NODE, sizeof(MY_DHT_NODE)) == -1) {
-	        perror("bind");
-	        close(ipv4_socket);
-	        exit(EXIT_FAILURE);
-	    }
+	char* bootstrap_nodes[numlines]; /* = { //"DHT_Searches.txt"
+			"xxx.xxx.xxx.xxx:ppppp"
+	};
+	*/
 
+	char **nodes = loadBootstrapNodes(filename, bootstrap_nodes);
 
-	unsigned char* node_id = generate_nodeID();
+	for (int i = 0; i < numlines; i++) {
+		bootstrap_nodes[i] = strdup(nodes[i]);
+	}
+	int start = 0;
+	int end = numlines -1;
 
-	if (dht_init(ipv4_socket, ipv6_socket, node_id, NULL) < 0){
-		printf("ERROR: reserving sockets failed!\n");
-		return 1;
+	while (start < end) { // start with the latest nodes. (inverting the array)
+		char *temp = bootstrap_nodes[start];
+	    bootstrap_nodes[start] = bootstrap_nodes[end];
+	    bootstrap_nodes[end] = temp;
+	    start++;
+	    end--;
 	}
 
+	numlines = removeDuplicates(bootstrap_nodes, numlines);
 
-	struct sockaddr_in tracker;
-	//struct hostent *hostinfo;
-	//struct in_addr *address;
-	struct sockaddr sa;
-	//char *hostname;
-	char *ip;
-	//ping_all();
+	int port = 6881; //1025 + rand() % (65535 - 1025 + 1);
+	//struct timeval timeout;
 
-	//struct in_addr *address;
+	//unsigned char* node_id = generate_nodeID();
 
-	int size_buffer = 65535; //the size of the buffer.
-	int size_possible_nodes = sizeof(bootstrap_nodes) / sizeof(bootstrap_nodes[0]);
-
-	char buffer[size_buffer];
-	int closure;
-
-	initscr();  // Initialize ncurses
-	cbreak();   // Line buffering disabled
-	noecho();   // Don't echo user input
-	nodelay(stdscr, TRUE);  // Make getch() non-blocking
-	scrollok(stdscr, TRUE); // Enable scrolling in the window
-
-	int ch;
-	int good = 0, dubious = 0, cached = 0, incoming = 0;
 	int g = 0;
-	//char *hostname;
-	//char *ip;
-	bool bootstrapped = false;
+	int number_of_nodes = numlines;
+	pthread_t thread_pool[number_of_nodes];
 
+	int sockets4[number_of_nodes];
+	int sockets6[number_of_nodes];
 
+	unsigned char *nodeIDs[number_of_nodes];
 
-	while (1) {
-		if (!bootstrapped){
-			printw("\rbootstrapping...[%d/%d]", g+1, size_possible_nodes);
-		}
+	for (int h = 0; h < number_of_nodes; h++) {
+		unsigned char *node_id = generate_nodeID();
+		nodeIDs[h] = malloc(strlen((const char *)(node_id)) + 1);
+		memcpy(nodeIDs[h], node_id, strlen((const char*)(node_id)) + 1);
+		printf("NODE_ID = %s\n", node_id);
+		printf("nodeIDs[h] = %s\n", nodeIDs[h]);
+	}
 
-		ch = getch();  // Check for a keypress without blocking
+	while (g < number_of_nodes){
 
-		if (ch == 'q' || ch == 'Q') {
-		    printw("Exiting...\n");
-		    break;
-		}
+		    int ipv4_socket = create_ipv4_socket();
+			int ipv6_socket = create_ipv6_socket();
 
+			sockets4[g] = ipv4_socket;
+			sockets6[g] = ipv6_socket;
 
-		char *token;
-		char *current_node = strdup(bootstrap_nodes[g]);
-		token = strtok(current_node, ":");
-		if (token != NULL) {
+			struct sockaddr_in MY_DHT_NODE;
+			memset(&MY_DHT_NODE, 0, sizeof(MY_DHT_NODE));
 
-			//hostname = token; // Get the first token as the IP address
-			ip = token;
+			MY_DHT_NODE.sin_family = AF_INET;
+			MY_DHT_NODE.sin_port = htons(port);
+			MY_DHT_NODE.sin_addr.s_addr = INADDR_ANY; // Bind to all available network interfaces
 
-			token = strtok(NULL, ":"); // Get the next token (port)
-
-			if (token != NULL) {
-				port = atoi(token); // Convert the port token to an integer
+			// Bind the socket to the specified port and address
+			if (bind(ipv4_socket, (struct sockaddr *)&MY_DHT_NODE, sizeof(MY_DHT_NODE)) == -1) {
+			    perror("bind");
+			    close(ipv4_socket);
+			    exit(EXIT_FAILURE);
 			}
-		}
 
-		//hostinfo = gethostbyname(hostname);
-		//address = (struct in_addr *) (ip);//(hostinfo->h_addr);
+			if (dht_init(ipv4_socket, ipv6_socket, nodeIDs[g], NULL, sizeof(double), nodeIDs[g]) < 0){
+				printf("ERROR: reserving sockets failed!\n");
+				return 1;
+			}
 
-		//ip = inet_ntoa(*address);
 
-		tracker.sin_family = AF_INET;
-		tracker.sin_port = htons(port);
-		inet_pton(AF_INET, ip, &(tracker.sin_addr));
+		    // Create a new params structure for each thread
+		    struct WorkParams* params = malloc(sizeof(struct WorkParams));
 
-		memcpy(&sa, &tracker, sizeof(tracker));
+		    params->ipv4_socket = ipv4_socket;
+		    strcpy(params->bootstrap_node, bootstrap_nodes[g]);
+		    params->port = port;
+		    params->filename = filename;
+		    params->Searches_filename = Searches_filename;
+		    params->info_hash = info_hash;
+		    params->MY_DHT_NODE = MY_DHT_NODE;
+		    params->myid = nodeIDs[g];
 
-		if (!bootstrapped){
-			dht_ping_node(&sa, sizeof(sa));
-		}
+		    pthread_create(&thread_pool[g], NULL, thread_function, (void*)params);
 
-	   char* info_hash = "f1fa38021f9831440ae4fdc177872cc34a5ac7fc"; //Linux Mint Debian Edition 5 Cinnamon 64Bit ISO
+			port++;
+		    g++;
+	}
 
-	   FD_ZERO(&read_fds);
-	   FD_SET(ipv4_socket, &read_fds);
-	   FD_SET(ipv6_socket, &read_fds);
-
-	   // Generate a random timeout value in the range of 1 to 5 seconds
-	   timeout.tv_sec = (int)(1 + rand() % 30);
-	   closure = timeout.tv_sec;
-	   timeout.tv_usec = 0;
-
-	   int result_ipv4 = select(ipv4_socket + 1, &read_fds, NULL, NULL, &timeout);
-	   //int result_ipv6 = select(ipv6_socket + 1, &read_fds, NULL, NULL, &timeout);
-
-	   if (result_ipv4 == -1){ //|| result_ipv6 == -1) {
-	       perror("select");
-	       exit(1);
-	       } else if (result_ipv4 == 0){// && result_ipv6 == 0) {
-	    	   dht_periodic(&buffer, 0,&sa, sizeof(sa),&timeout.tv_sec, callback, &closure);
-	    	   //Scan(buffer, timeout.tv_sec, &closure);
-	        } else {
-	        	if (result_ipv4 > 0){
-	        		sockfd = ipv4_socket;
-	        	}
-	        	//if (result_ipv6 > 0){
-	        	//	sockfd = ipv6_socket;
-	        	//}
-	            if (FD_ISSET(sockfd, &read_fds)) {
-	                // Data is available on the socket, you can read it.
-	                ssize_t bytesRead = recv(sockfd, buffer, size_buffer, 0);
-	                if (bytesRead > 8) { // '\0'
-	                    // Handle the received data
-	                    //printf("Received data from the socket: %s\n", buffer);
-	                	//Scan(buffer, timeout.tv_sec, &closure);
-	                    dht_periodic(&buffer, sizeof(buffer),&sa, sizeof(sa),&timeout.tv_sec, callback, &closure);
-	                    dht_nodes(MY_DHT_NODE.sin_family, &good, &dubious, &cached, &incoming);
-	                    if (!bootstrapped){
-	                    	bootstrapped = true;
-	                    }
-	                } else if (bytesRead == 0) {
-	                    // Connection closed
-	                    printf("Connection closed by the remote host.\n");
-	                    close(sockfd);
-	                    break;
-	                //} else {
-	                //    perror("recv");
-	                }
-	            }
-	        }
-	   	   if (bootstrapped){
-	   		   printw("\nGood+Dubious->%d\n",dht_nodes(MY_DHT_NODE.sin_family, &good, &dubious, &cached, &incoming));
-	   		   printw("Dubious->%d\n",dubious);
-	   		   printw("Good->%d\n",good);
-	   		   if (dubious == 0 && good == 0){
-	   			   bootstrapped = false;
-	   		   }
-	   	   }
-	   	   refresh();
-	   	   if (dubious+good >= 50){
-	   		   dht_search((unsigned char *)(info_hash),port,MY_DHT_NODE.sin_family, callback, &closure);
-	   	   }
-	   	   if ((g+1 < size_possible_nodes && !bootstrapped)){
-	   		   g++;
-	   	   } else if (!bootstrapped && dubious < 0){
-	   		  printw("Could not bootstrap the provided list to kademlia networks :(");
-	   		  break;
-	   	   }
-	   	//buffer.clear()
-	   	memset(buffer, '\0', sizeof(*buffer));
-	    }
-
-	endwin();  // Clean up ncurses
-
-	close(sockfd);
-
-	dht_dump_tables(stdout);
-
-	save_bucket(good+dubious);
-
+	for (int i = 0; i < number_of_nodes; ++i) {
+	        pthread_join(thread_pool[i], NULL);
+	}
+	pthread_mutex_destroy(&mutex);
+	//close(sockfd);
 	dht_uninit();
-	close(ipv4_socket);
-	close(ipv6_socket);
+
+
+
+	for (int i;i<number_of_nodes;i++){
+		close(sockets4[i]);
+		close(sockets6[i]);
+	}
+
 	return 0;
 }
